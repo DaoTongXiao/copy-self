@@ -1,30 +1,21 @@
 import re
 import operator
 import time
-from typing import TypedDict, List, Annotated, Sequence
+import ast
+from typing import TypedDict, List, Annotated, Sequence, cast
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
 from core.prompt import react_system_prompt_template
 from utils.logger import logger
+from core.tools import TOOLS
 
 # Define the state
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     recursion_limit: int
 
-# Define tools
-@tool
-def search_internet(query: str) -> str:
-    """Search the internet for information."""
-    logger.info(f"--- Calling tool: search_internet(query='{query}') ---")
-    return f"Search results for \"{query}\": This year's Australian Open men's champion is Sinner, and his hometown is Sesto, South Tyrol, Italy."
-
-@tool
-def current_date() -> str:
-    """Get the current date."""
-    logger.info(f"--- Calling tool: current_date ---")
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+# Tools moved to core.tools (see TOOLS)
 
 # Create the ReAct Agent
 class ReActAgent:
@@ -75,15 +66,27 @@ class ReActAgent:
                 }
 
             try:
-                # Parse arguments
+                # Parse arguments (support numbers, booleans, null, lists, dicts, strings)
                 if args_str.strip():
-                    # Use regex to match arguments
-                    param_matches = re.findall(r'(\w+)=(["\\])(.*?)\2', args_str)
-                    if param_matches:
-                        tool_input = {param: value for param, _, value in param_matches}
-                    else:
-                        # Try simple no-argument call
-                        tool_input = {}
+                    # First, try to interpret as Python literals safely
+                    # Normalize common JSON literals to Python equivalents
+                    normalized = re.sub(r'\btrue\b', 'True', args_str, flags=re.IGNORECASE)
+                    normalized = re.sub(r'\bfalse\b', 'False', normalized, flags=re.IGNORECASE)
+                    normalized = re.sub(r'\bnull\b', 'None', normalized, flags=re.IGNORECASE)
+                    try:
+                        # Wrap into dict(...) form so "a=1, b=[...]" becomes a dict
+                        tool_input_candidate = ast.literal_eval(f"dict({normalized})")
+                        if not isinstance(tool_input_candidate, dict):
+                            raise ValueError("Parsed args are not a dict")
+                        tool_input = tool_input_candidate
+                    except Exception:
+                        # Fallback to legacy regex: only captures string arguments
+                        param_matches = re.findall(r'(\w+)=(["\\\'])(.*?)\2', args_str)
+                        if param_matches:
+                            tool_input = {param: value for param, _, value in param_matches}
+                        else:
+                            # No parseable arguments found; treat as empty
+                            tool_input = {}
                 else:
                     tool_input = {}
 
@@ -132,7 +135,8 @@ class ReActAgent:
 
     def call_model(self, state: AgentState):
         """Call the model to generate a response."""
-        messages = state['messages'].copy()
+        # Ensure messages is a list for safe mutation locally
+        messages = list(state['messages'])
 
         # If the first message is not a system message, add a system message
         if not messages or not isinstance(messages[0], SystemMessage):
@@ -161,7 +165,7 @@ class ReActAgent:
         if not isinstance(last_message, AIMessage):
             return {"messages": []}
 
-        action = self._parse_action(last_message.content)
+        action = self._parse_action(cast(str, last_message.content))
 
         logger.info(f"\n=== Parsing Result ===")
         logger.info(f"Type: {action.get('type', 'unknown')}")
@@ -208,7 +212,7 @@ class ReActAgent:
 
 def create_graph(llm):
     """Create the workflow graph."""
-    tools = [search_internet, current_date]
+    tools = TOOLS
     agent = ReActAgent(llm, tools, react_system_prompt_template)
 
     workflow = StateGraph(AgentState)
@@ -233,8 +237,9 @@ def run_react_agent(llm, query: str = "Where is the hometown of this year's Aust
     """Run the ReAct Agent."""
     app = create_graph(llm)
 
-    initial_state = {
-        "messages": [HumanMessage(content=f"<question>{query}</question>")]
+    initial_state: AgentState = {
+        "messages": [HumanMessage(content=f"<question>{query}</question>")],
+        "recursion_limit": 10,
     }
 
     logger.info(f"=== Starting ReAct Agent ===")
@@ -264,13 +269,14 @@ def run_react_agent(llm, query: str = "Where is the hometown of this year's Aust
             if isinstance(last_message, ToolMessage):
                 logger.info(f"Tool Message: {last_message.content}")
             elif isinstance(last_message, HumanMessage):
-                if last_message.content.startswith("<observation>"):
-                    logger.info(f"Observation: {last_message.content}")
+                content = cast(str, last_message.content)
+                if content.startswith("<observation>"):
+                    logger.info(f"Observation: {content}")
                 else:
-                    logger.info(f"Human Message: {last_message.content}")
+                    logger.info(f"Human Message: {content}")
             elif isinstance(last_message, AIMessage):
                 # Only display key information to simplify output
-                content = last_message.content
+                content = cast(str, last_message.content)
                 if "<final_answer>" in content:
                     final_answer_match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
                     if final_answer_match:
@@ -299,5 +305,3 @@ def run_react_agent(llm, query: str = "Where is the hometown of this year's Aust
         logger.info("⚠️ Execution efficiency: Good (completed within 3 turns)")
     else:
         logger.info("❌ Execution efficiency: Needs optimization (more than 3 turns)")
-
-
