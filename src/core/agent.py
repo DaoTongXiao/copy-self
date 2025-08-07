@@ -1,24 +1,31 @@
+# -*- coding: utf-8 -*-
 import re
 import operator
 import time
-from typing import TypedDict, List, Annotated, Sequence
+import json
+from typing import TypedDict, List, Annotated
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
-from core.prompt import react_system_prompt_template
+from core.prompt import planner_system_prompt_template, final_answer_prompt_template
 from utils.logger import logger
 
-# Define the state
+# --- State Definition ---
 class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], operator.add]
+    question: str
+    plan: List[str]
+    observations: Annotated[list, operator.add]
+    final_answer: str
     recursion_limit: int
 
-# Define tools
+# --- Tools ---
 @tool
 def search_internet(query: str) -> str:
     """Search the internet for information."""
     logger.info(f"--- Calling tool: search_internet(query='{query}') ---")
-    return f"Search results for \"{query}\": This year's Australian Open men's champion is Sinner, and his hometown is Sesto, South Tyrol, Italy."
+    # Simulate a search result
+    if "sinner" in query.lower() and "hometown" in query.lower():
+        return "Search results for \"hometown of 2024 Australian Open men's champion Sinner\": Jannik Sinner's hometown is Sesto, in the South Tyrol region of Italy."
+    return f"Search results for \"{query}\": This year's Australian Open men's champion is Sinner."
 
 @tool
 def current_date() -> str:
@@ -26,278 +33,150 @@ def current_date() -> str:
     logger.info(f"--- Calling tool: current_date ---")
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
-# Create the ReAct Agent
-class ReActAgent:
-    def __init__(self, llm, tools, system_message_template):
+# --- Plan-and-Execute Agent ---
+class PlanExecuteAgent:
+    def __init__(self, llm, tools):
         self.llm = llm
         self.tools = tools
         self.tool_map = {tool.name: tool for tool in self.tools}
-        self.system_message_template = system_message_template
 
-    def _get_system_message(self):
-        tool_list = "\n".join([f"- {tool.name}: {tool.description}" for tool in self.tools])
-        return self.system_message_template.format(tool_list=tool_list)
+    def get_tool_list_str(self):
+        return "\n".join([f"- {tool.name}: {tool.description}" for tool in self.tools])
 
-    def _parse_action(self, text: str):
-        """Parse the action from the model output."""
-        thought_match = re.search(r"<thought>(.*?)</thought>", text, re.DOTALL)
-        action_match = re.search(r"<action>(.*?)</action>", text, re.DOTALL)
-        final_answer_match = re.search(r"<final_answer>(.*?)</final_answer>", text, re.DOTALL)
-        clarification_match = re.search(r"<clarification>(.*?)</clarification>", text, re.DOTALL)
+    def planner(self, state: AgentState):
+        """Generates an execution plan."""
+        logger.info("\n=== Generating Plan ===")
+        question = state['question']
+        tool_list = self.get_tool_list_str()
 
-        thought = thought_match.group(1).strip() if thought_match else ""
+        prompt = planner_system_prompt_template.format(
+            tool_list=tool_list,
+            question=question
+        )
+        
+        response = self.llm.invoke(prompt)
+        plan_str = response.content.strip()
+        
+        try:
+            # The model might return a markdown code block
+            cleaned_plan_str = re.sub(r"```json\n|\n```", "", plan_str)
+            plan = json.loads(cleaned_plan_str)
+            logger.info(f"Generated Plan: {plan}")
+            logger.info("======================")
+            return {"plan": plan}
+        except json.JSONDecodeError:
+            error_msg = f"Error: Planner did not return a valid JSON list. Output: {plan_str}"
+            logger.error(error_msg)
+            return {"final_answer": error_msg}
 
-        if clarification_match:
-            return {
-                "thought": thought,
-                "clarification": clarification_match.group(1).strip(),
-                "type": "clarification"
-            }
+    def executor(self, state: AgentState):
+        """Executes the tools in the plan."""
+        logger.info("\n=== Executing Plan ===")
+        plan = state.get('plan', [])
+        observations = []
 
-        if action_match:
-            action_str = action_match.group(1).strip()
-            # Parse tool call: tool_name(param1="value1", param2="value2")
-            match = re.match(r"(\w+)\((.*)\)", action_str)
+        for i, step in enumerate(plan):
+            logger.info(f"--- Step {i+1}/{len(plan)}: {step} ---")
+            
+            match = re.match(r"(\w+)\((.*)\)", step)
             if not match:
-                return {
-                    "thought": thought,
-                    "error": f"Could not parse action format: {action_str}. Correct format is: tool_name(param1=\"value1\")",
-                    "type": "error"
-                }
+                observation = f"Error: Could not parse action format: {step}"
+                logger.error(observation)
+                observations.append(observation)
+                continue
 
             tool_name, args_str = match.groups()
+            tool_to_call = self.tool_map.get(tool_name)
 
-            if tool_name not in self.tool_map:
-                return {
-                    "thought": thought,
-                    "error": f"Tool '{tool_name}' does not exist. Available tools: {list(self.tool_map.keys())}",
-                    "type": "error"
-                }
+            if not tool_to_call:
+                observation = f"Error: Tool '{tool_name}' not found."
+                logger.error(observation)
+                observations.append(observation)
+                continue
 
             try:
-                # Parse arguments
+                tool_input = {}
                 if args_str.strip():
-                    # Use regex to match arguments
-                    param_matches = re.findall(r'(\w+)=(["\\])(.*?)\2', args_str)
+                    # This regex is simplified and might need to be more robust
+                    param_matches = re.findall(r'(\w+)=["\'](.*?)["\']', args_str)
                     if param_matches:
-                        tool_input = {param: value for param, _, value in param_matches}
-                    else:
-                        # Try simple no-argument call
-                        tool_input = {}
-                else:
-                    tool_input = {}
+                        tool_input = dict(param_matches)
 
-                return {
-                    "thought": thought,
-                    "tool": tool_name,
-                    "tool_input": tool_input,
-                    "type": "action"
-                }
-            except Exception as e:
-                return {
-                    "thought": thought,
-                    "error": f"Argument parsing error: {e}. Argument string: {args_str}",
-                    "type": "error"
-                }
-
-        if final_answer_match:
-            return {
-                "thought": thought,
-                "final_answer": final_answer_match.group(1).strip(),
-                "type": "final_answer"
-            }
-
-        return {
-            "thought": thought,
-            "error": "No valid <action> or <final_answer> tag found",
-            "type": "error"
-        }
-
-    def should_continue(self, state: AgentState):
-        """Determine whether to continue execution."""
-        if not state['messages']:
-            return "continue"
-
-        last_message = state['messages'][-1]
-
-        # If it's an AIMessage, check if it contains a final_answer or clarification
-        if isinstance(last_message, AIMessage):
-            content = last_message.content
-            if "<final_answer>" in content or "<clarification>" in content:
-                return "end"
-            elif "<action>" in content:
-                return "continue"
-
-        return "continue"
-
-    def call_model(self, state: AgentState):
-        """Call the model to generate a response."""
-        messages = state['messages'].copy()
-
-        # If the first message is not a system message, add a system message
-        if not messages or not isinstance(messages[0], SystemMessage):
-            system_message = SystemMessage(content=self._get_system_message())
-            messages.insert(0, system_message)
-
-        try:
-            response = self.llm.invoke(messages)
-            logger.info(f"\n=== Model Output ===")
-            logger.info(response.content)
-            logger.info("====================")
-
-            return {"messages": [response]}
-        except Exception as e:
-            error_msg = f"Error calling model: {e}"
-            logger.error(f"Error: {error_msg}")
-            return {"messages": [AIMessage(content=f"<final_answer>Sorry, an error occurred while processing the request: {error_msg}</final_answer>")]}
-
-    def call_tool(self, state: AgentState):
-        """Call a tool."""
-        if not state['messages']:
-            return {"messages": []}
-
-        last_message = state['messages'][-1]
-
-        if not isinstance(last_message, AIMessage):
-            return {"messages": []}
-
-        action = self._parse_action(last_message.content)
-
-        logger.info(f"\n=== Parsing Result ===")
-        logger.info(f"Type: {action.get('type', 'unknown')}")
-        logger.info(f"Thought: {action.get('thought', 'N/A')}")
-        logger.info("====================")
-
-        if action.get("type") == "error":
-            error_message = HumanMessage(
-                content=f"Parsing error: {action['error']}. Please check your format and try again."
-            )
-            return {"messages": [error_message]}
-
-        if action.get("type") in ["final_answer", "clarification"]:
-            return {"messages": []}
-
-        if action.get("type") != "action":
-            return {"messages": []}
-
-        tool_name = action["tool"]
-        tool_input = action["tool_input"]
-
-        tool = self.tool_map.get(tool_name)
-        if not tool:
-            observation = f"Error: Tool '{tool_name}' not found"
-        else:
-            try:
-                logger.info(f"\n=== Executing Tool ===")
-                logger.info(f"Tool: {tool_name}")
-                logger.info(f"Arguments: {tool_input}")
-
-                observation = tool.invoke(tool_input)
-                logger.info(f"Result: {observation}")
-                logger.info("====================")
+                result = tool_to_call.invoke(tool_input)
+                observation = str(result)
+                logger.info(f"Observation: {observation}")
             except Exception as e:
                 observation = f"Error executing tool '{tool_name}': {e}"
-                logger.error(f"Tool execution error: {observation}")
+                logger.error(observation)
+            
+            observations.append(observation)
+            logger.info("--------------------")
 
-        # Create a message containing the observation
-        observation_message = HumanMessage(
-            content=f"<observation>{observation}</observation>"
+        return {"observations": observations}
+
+    def generate_final_answer(self, state: AgentState):
+        """Generates the final answer based on observations."""
+        logger.info("\n=== Generating Final Answer ===")
+        question = state['question']
+        observations = state['observations']
+
+        history = ""
+        for i, obs in enumerate(observations):
+            history += f"Step {i+1} Observation: {obs}\n"
+
+        prompt = final_answer_prompt_template.format(
+            history=history.strip(),
+            question=question
         )
 
-        return {"messages": [observation_message]}
+        response = self.llm.invoke(prompt)
+        final_answer = response.content.strip()
+        
+        logger.info(f"🎯 Final Answer: {final_answer}")
+        logger.info("===========================")
+        return {"final_answer": final_answer}
 
 def create_graph(llm):
     """Create the workflow graph."""
     tools = [search_internet, current_date]
-    agent = ReActAgent(llm, tools, react_system_prompt_template)
+    agent = PlanExecuteAgent(llm, tools)
 
     workflow = StateGraph(AgentState)
-    workflow.add_node("agent", agent.call_model)
-    workflow.add_node("action", agent.call_tool)
+    
+    workflow.add_node("planner", agent.planner)
+    workflow.add_node("executor", agent.executor)
+    workflow.add_node("final_answer_generator", agent.generate_final_answer)
 
-    workflow.set_entry_point("agent")
-
-    workflow.add_conditional_edges(
-        "agent",
-        agent.should_continue,
-        {
-            "continue": "action",
-            "end": END,
-        },
-    )
-    workflow.add_edge("action", "agent")
+    workflow.set_entry_point("planner")
+    workflow.add_edge("planner", "executor")
+    workflow.add_edge("executor", "final_answer_generator")
+    workflow.add_edge("final_answer_generator", END)
 
     return workflow.compile()
 
-def run_react_agent(llm, query: str = "Where is the hometown of this year's Australian Open men's champion?"):
-    """Run the ReAct Agent."""
+def run_plan_execute_agent(llm, query: str = "Where is the hometown of this year's Australian Open men's champion?"):
+    """Run the Plan-and-Execute Agent."""
     app = create_graph(llm)
 
-    initial_state = {
-        "messages": [HumanMessage(content=f"<question>{query}</question>")]
+    initial_state: AgentState = {
+        "question": query,
+        "observations": [],
+        "plan": [],
+        "final_answer": "",
+        "recursion_limit": 10
     }
 
-    logger.info(f"=== Starting ReAct Agent ===")
+    logger.info(f"=== Starting Plan-and-Execute Agent ===")
     logger.info(f"Query: {query}")
     logger.info("=" * 50)
 
-    step_count = 0
-    agent_turns = 0  # Count the number of agent node executions
-
     try:
-        for output in app.stream(initial_state, {"recursion_limit": 10}):
-            step_count += 1
-            node = list(output.keys())[0]
-            state = list(output.values())[0]
-
-            if node == 'agent':
-                agent_turns += 1
-
-            logger.info(f"\n--- Step {step_count}: Node '{node}' ---")
-
-            if not state.get('messages'):
-                logger.info("(No message output)")
-                continue
-
-            last_message = state['messages'][-1]
-
-            if isinstance(last_message, ToolMessage):
-                logger.info(f"Tool Message: {last_message.content}")
-            elif isinstance(last_message, HumanMessage):
-                if last_message.content.startswith("<observation>"):
-                    logger.info(f"Observation: {last_message.content}")
-                else:
-                    logger.info(f"Human Message: {last_message.content}")
-            elif isinstance(last_message, AIMessage):
-                # Only display key information to simplify output
-                content = last_message.content
-                if "<final_answer>" in content:
-                    final_answer_match = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
-                    if final_answer_match:
-                        logger.info(f"🎯 Final Answer: {final_answer_match.group(1).strip()}")
-                elif "<action>" in content:
-                    action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
-                    if action_match:
-                        logger.info(f"🔧 Executing Action: {action_match.group(1).strip()}")
-                else:
-                    logger.info(f"AI Message: {content}")
-            else:
-                logger.info(f"Other message type: {type(last_message)} - {last_message.content}")
-
+        final_state = app.invoke(initial_state, {"recursion_limit": 10})
+        
+        logger.info("\n=== Plan-and-Execute Agent Finished ===")
+        # The final answer is already logged in the generate_final_answer node
+        
     except Exception as e:
         logger.error(f"\nAn error occurred during execution: {e}")
         import traceback
         traceback.print_exc()
-
-    logger.info(f"\n=== ReAct Agent Finished ===")
-    logger.info(f"Total steps: {step_count} | Agent turns: {agent_turns}")
-
-    # Evaluate efficiency
-    if agent_turns <= 2:
-        logger.info("✅ Execution efficiency: Excellent (completed within 2 turns)")
-    elif agent_turns <= 3:
-        logger.info("⚠️ Execution efficiency: Good (completed within 3 turns)")
-    else:
-        logger.info("❌ Execution efficiency: Needs optimization (more than 3 turns)")
-
-
