@@ -4,7 +4,7 @@
 from utils.logger import logger
 
 def test_various_queries(llm):
-    """Test various queries."""
+    """Test various queries covering date, math, tool-chaining and clarification."""
     queries = [
       "查询北京的天气？"
     ]
