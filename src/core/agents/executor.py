@@ -5,6 +5,7 @@ from ..tools import get_tool_map
 from utils.logger import logger
 from ..state import AgentState
 
+
 class Executor:
     def __init__(self):
         self.tool_map = get_tool_map()
@@ -12,12 +13,12 @@ class Executor:
     def __call__(self, state: AgentState):
         """Executes the tools in the plan."""
         logger.info("\n=== Executing Plan ===")
-        plan = state.get('plan', [])
+        plan = state.get("plan", [])
         observations = []
 
         for i, step in enumerate(plan):
             logger.info(f"--- Step {i+1}/{len(plan)}: {step} ---")
-            
+
             match = re.match(r"(\w+)\((.*)\)", step)
             if not match:
                 observation = f"Error: Could not parse action format: {step}"
@@ -45,7 +46,7 @@ class Executor:
                             tool_input = dict(param_matches)
                         else:
                             first_arg_name = list(tool_to_call.args.keys())[0]
-                            tool_input = {first_arg_name: args_str.strip('"\'')}
+                            tool_input = {first_arg_name: args_str.strip("\"'")}
 
                 result = tool_to_call.invoke(tool_input)
                 observation = str(result)
@@ -53,7 +54,7 @@ class Executor:
             except Exception as e:
                 observation = f"Error executing tool '{tool_name}': {e}"
                 logger.error(observation)
-            
+
             observations.append(observation)
             logger.info("--------------------")
 

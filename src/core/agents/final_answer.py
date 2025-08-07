@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from ..prompts import final_answer_prompt_template
+from ..prompts.prompts import final_answer_prompt_template
 from utils.logger import logger
 from ..state import AgentState
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import re
 import json
-from ..prompts import planner_system_prompt_template
+from ..prompts.prompts import planner_system_prompt_template
 from ..tools import get_tools
 from utils.logger import logger
 from ..state import AgentState

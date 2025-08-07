@@ -16,6 +16,6 @@ def test_various_queries(llm):
         run_plan_execute_agent(llm, query)
 
 if __name__ == "__main__":
-    from core.llm_provider import llm  # Import your llm instance
+    from core.provider.llm_provider import llm  # Import your llm instance
     from core.runner import run_plan_execute_agent
     test_various_queries(llm)
