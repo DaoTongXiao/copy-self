@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-from typing import List
 from langchain_core.tools import BaseTool
 
-_tools: List[BaseTool] = []
+_tools: list[BaseTool] = []
 _tool_map: dict[str, BaseTool] = {}
 
-def register_tool(tool_func: BaseTool) -> BaseTool:
+def register(tool_func: BaseTool) -> BaseTool:
     """
     一个用于注册工具的装饰器。
     它应该应用于已经被@tool装饰器装饰过的函数所返回的对象。
@@ -15,7 +14,7 @@ def register_tool(tool_func: BaseTool) -> BaseTool:
         _tool_map[tool_func.name] = tool_func
     return tool_func
 
-def get_tools() -> List[BaseTool]:
+def get_tools() -> list[BaseTool]:
     """返回已注册工具的列表。"""
     return _tools
 
